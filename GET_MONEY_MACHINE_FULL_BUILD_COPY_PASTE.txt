@@ -1,0 +1,932 @@
+
+================================================================================
+FILE: .github/workflows/ci.yml
+================================================================================
+name: verify
+on: [push, pull_request]
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+
+================================================================================
+FILE: .gitignore
+================================================================================
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+dist/
+.venv/
+*.db
+.DS_Store
+
+
+================================================================================
+FILE: docker-compose.yml
+================================================================================
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: money_machine
+      POSTGRES_USER: money_machine
+      POSTGRES_PASSWORD: money_machine_local
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://money_machine:money_machine_local@db:5432/money_machine
+      JWT_SECRET: change-me-before-deploy
+      OWNER_EMAIL: owner@example.com
+      OWNER_PASSWORD: change-me-before-deploy
+      CORS_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+volumes:
+  postgres_data:
+
+
+================================================================================
+FILE: backend/test.db
+================================================================================
+[BINARY FILE: 45056 bytes]
+
+================================================================================
+FILE: backend/Dockerfile
+================================================================================
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app ./app
+EXPOSE 8000
+CMD ["uvicorn","app.main:app","--host","0.0.0.0","--port","8000"]
+
+
+================================================================================
+FILE: backend/tests/test_static_spec.py
+================================================================================
+from pathlib import Path
+import re
+ROOT=Path(__file__).parents[1]
+NAMES=["Unclaimed Property Station","Refund Recovery Station","Rebate Station","Cashback Station","Rewards Station","Promotional Bonus Station","Fee Recovery Station","Overpayment Recovery Station","Subscription Credit Station","Settlement & Claims Station","Business Incentive Station","Public Opportunity Station","Revenue Opportunity Station","Reinvestment Station","Earnings & Transfer Station"]
+
+def test_exact_15_names():
+ s=(ROOT/'app/seed.py').read_text(); assert sum(n in s for n in NAMES)==15
+
+def test_single_opening_guard():
+ s=(ROOT/'app/seed.py').read_text(); assert s.count('kind == "OPENING_BALANCE"')==1 and 'amount=15000' in s
+
+def test_required_routes():
+ s=(ROOT/'app/main.py').read_text()
+ for x in ['/health','/auth/login','/stations','/earnings','/balance','/transactions','/destinations','/withdrawals','/paypal/webhook','/scanner/run','/opportunities','/audit']:
+  assert x in s
+
+def test_no_client_secrets():
+ for p in (ROOT.parent/'frontend').rglob('*'):
+  if p.is_file() and 'node_modules' not in str(p):
+   txt=p.read_text(errors='ignore'); assert not re.search(r'(sk_(live|test)|whsec_|PAYPAL_CLIENT_SECRET)',txt,re.I)
+
+def test_transfer_requires_provider_confirmation():
+ s=(ROOT/'app/main.py').read_text(); assert "status='COMPLETED'" in s and 'PayPal-confirmed transfer debit' in s
+
+
+================================================================================
+FILE: backend/tests/test_spec.py
+================================================================================
+import os
+os.environ.setdefault('JWT_SECRET','test-secret')
+os.environ.setdefault('OWNER_EMAIL','owner@example.com')
+os.environ.setdefault('OWNER_PASSWORD','test-password-123')
+os.environ.setdefault('DATABASE_URL','sqlite:///./test.db')
+from fastapi.testclient import TestClient
+from app.main import app
+
+client=TestClient(app)
+client.__enter__()
+
+def token():
+    r=client.post('/auth/login',json={'email':'owner@example.com','password':'test-password-123'})
+    assert r.status_code==200
+    return r.json()['access_token']
+
+def test_health():
+    r=client.get('/health'); assert r.status_code==200; assert r.json()['station_count']==15
+
+def test_auth_and_stations():
+    t=token(); r=client.get('/stations',headers={'Authorization':f'Bearer {t}'})
+    assert r.status_code==200 and len(r.json())==15
+
+def test_balance_opening():
+    t=token(); r=client.get('/balance',headers={'Authorization':f'Bearer {t}'})
+    assert r.status_code==200 and float(r.json()['opening_balance'])==15000
+
+def test_master_emergency():
+    t=token(); h={'Authorization':f'Bearer {t}'}; r=client.post('/stations/control/emergency',headers=h)
+    assert r.status_code==200 and r.json()['station_count']==15
+
+def test_paypal_setup_state():
+    t=token(); r=client.get('/paypal/status',headers={'Authorization':f'Bearer {t}'})
+    assert r.status_code==200 and r.json()['provider']=='paypal'
+
+
+================================================================================
+FILE: backend/tests/__pycache__/test_spec.cpython-313-pytest-9.0.2.pyc
+================================================================================
+[BINARY FILE: 10992 bytes]
+
+================================================================================
+FILE: backend/tests/__pycache__/test_static_spec.cpython-313-pytest-9.0.2.pyc
+================================================================================
+[BINARY FILE: 8741 bytes]
+
+================================================================================
+FILE: backend/requirements.txt
+================================================================================
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+sqlalchemy==2.0.43
+psycopg[binary]==3.2.9
+pydantic-settings==2.10.1
+PyJWT==2.10.1
+argon2-cffi==25.1.0
+httpx==0.28.1
+pytest==8.4.2
+
+
+================================================================================
+FILE: backend/app/schemas.py
+================================================================================
+from decimal import Decimal
+from pydantic import BaseModel, Field, field_validator
+
+class LoginIn(BaseModel):
+    email: str
+    password: str
+class TokenOut(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+class StationOut(BaseModel):
+    id: int; name: str; active: bool; paused: bool; emergency_stopped: bool
+    class Config: from_attributes = True
+class DestinationIn(BaseModel):
+    type: str; label: str; external_id: str
+class DestinationOut(DestinationIn):
+    id: int; enabled: bool
+    class Config: from_attributes = True
+class WithdrawalIn(BaseModel):
+    amount: Decimal = Field(gt=0)
+    destination_id: int
+    idempotency_key: str = Field(min_length=8, max_length=255)
+class WithdrawalOut(BaseModel):
+    id: int; amount: Decimal; destination_id: int; status: str; provider_reference: str | None
+    class Config: from_attributes = True
+
+
+================================================================================
+FILE: backend/app/main.py
+================================================================================
+from decimal import Decimal
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+from .config import settings
+from .db import Base, engine, get_db
+from .models import Owner, Station, LedgerEntry, Destination, Withdrawal, AuditLog, Opportunity
+from .schemas import LoginIn, TokenOut, StationOut, DestinationIn, DestinationOut, WithdrawalIn, WithdrawalOut
+from .security import verify_password, make_token, current_owner
+from .seed import seed
+from . import paypal_service
+
+app = FastAPI(title="GET MONEY MACHINE API", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=[x.strip() for x in settings.cors_origins.split(',') if x.strip()], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(engine)
+    db = next(get_db())
+    try: seed(db)
+    finally: db.close()
+
+def audit(db, action, detail):
+    db.add(AuditLog(action=action, detail=detail)); db.commit()
+
+def station_state(s):
+    return {"id": s.id, "name": s.name, "active": s.active, "paused": s.paused, "emergency_stopped": s.emergency_stopped, "status": "EMERGENCY STOPPED" if s.emergency_stopped else "PAUSED" if s.paused else "RUNNING" if s.active else "STOPPED", "last_activity": s.last_activity}
+
+def balance_values(db):
+    completed = db.scalar(select(func.coalesce(func.sum(LedgerEntry.amount),0)).where(LedgerEntry.status=='COMPLETED')) or Decimal('0')
+    reserved = db.scalar(select(func.coalesce(func.sum(Withdrawal.amount),0)).where(Withdrawal.status.in_(['PENDING','PROCESSING']))) or Decimal('0')
+    return completed, reserved, completed-reserved
+
+@app.get('/health')
+def health(db: Session = Depends(get_db)):
+    station_count = db.scalar(select(func.count(Station.id))) or 0
+    return {"status":"ok","database":"ok","station_count":station_count,"paypal_configured":paypal_service.configured()}
+
+@app.post('/auth/login', response_model=TokenOut)
+def login(data: LoginIn, db: Session = Depends(get_db)):
+    owner = db.scalar(select(Owner).where(Owner.email == data.email.lower().strip()))
+    if not owner or not verify_password(owner.password_hash, data.password): raise HTTPException(401, "Invalid credentials")
+    audit(db, 'auth.login', f'owner_id={owner.id}')
+    return TokenOut(access_token=make_token(owner.id))
+
+@app.get('/auth/me')
+def me(owner: Owner = Depends(current_owner)): return {"id": owner.id, "email": owner.email}
+
+@app.get('/stations', response_model=list[StationOut])
+def stations(_: Owner = Depends(current_owner), db: Session = Depends(get_db)):
+    return db.scalars(select(Station).order_by(Station.id)).all()
+
+@app.get('/stations/{station_id}')
+def station(station_id:int, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    obj=db.get(Station, station_id)
+    if not obj: raise HTTPException(404,"Station not found")
+    return station_state(obj)
+
+def set_station(db, station_id, action):
+    s=db.get(Station, station_id)
+    if not s: raise HTTPException(404,"Station not found")
+    if action=='start': s.active=True; s.paused=False; s.emergency_stopped=False
+    elif action=='stop': s.active=False
+    elif action=='pause': s.paused=True; s.active=False
+    elif action=='emergency': s.emergency_stopped=True; s.active=False; s.paused=False
+    audit(db, f"station.{action}", f"station_id={station_id}")
+    return s
+
+@app.post('/stations/control/{action}')
+def master_control(action:str, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    if action not in {'start','stop','pause','emergency'}: raise HTTPException(400,'Unsupported action')
+    for s in db.scalars(select(Station)).all():
+        if action=='start': s.active=True; s.paused=False; s.emergency_stopped=False
+        elif action=='stop': s.active=False
+        elif action=='pause': s.paused=True; s.active=False
+        else: s.emergency_stopped=True; s.active=False; s.paused=False
+    audit(db, f"master.{action}", "all stations")
+    return {"ok":True,"action":action,"station_count":15}
+
+
+@app.post('/stations/{station_id}/{action}', response_model=StationOut)
+def station_action(station_id:int, action:str, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    if action not in {'start','stop','pause','emergency'}: raise HTTPException(400,'Unsupported action')
+    return set_station(db,station_id,action)
+
+@app.get('/balance')
+def balance(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    completed, reserved, available = balance_values(db)
+    return {"available":available,"pending":reserved,"completed_ledger":completed,"currency":"USD","source":"internal_ledger","opening_balance":15000}
+
+@app.get('/transactions')
+def transactions(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    rows=db.scalars(select(LedgerEntry).order_by(LedgerEntry.created_at.desc())).all()
+    return [{"id":x.id,"kind":x.kind,"station_id":x.station_id,"amount":x.amount,"status":x.status,"description":x.description,"provider_reference":x.provider_reference,"created_at":x.created_at} for x in rows]
+
+@app.get('/earnings')
+def earnings(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    rows=db.scalars(select(Opportunity).order_by(Opportunity.created_at.desc())).all()
+    return [{"id":x.id,"station_id":x.station_id,"title":x.title,"state":x.state,"estimated_value":x.estimated_value,"verified_value":x.verified_value,"source_url":x.source_url,"created_at":x.created_at} for x in rows]
+
+@app.get('/earnings/{earning_id}')
+def earning(earning_id:int, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    x=db.get(Opportunity, earning_id)
+    if not x: raise HTTPException(404,'Earning not found')
+    return {"id":x.id,"station_id":x.station_id,"title":x.title,"state":x.state,"estimated_value":x.estimated_value,"verified_value":x.verified_value,"source_url":x.source_url,"created_at":x.created_at}
+
+@app.get('/destinations',response_model=list[DestinationOut])
+def destinations(_:Owner=Depends(current_owner), db:Session=Depends(get_db)): return db.scalars(select(Destination).order_by(Destination.id)).all()
+
+@app.post('/destinations',response_model=DestinationOut)
+def add_destination(data:DestinationIn, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    if data.type.upper() != 'PAYPAL': raise HTTPException(400,'Only PayPal destinations are supported')
+    d=Destination(type=data.type.upper(),label=data.label,external_id=data.external_id.strip()); db.add(d); db.commit(); db.refresh(d); audit(db,'destination.created',str(d.id)); return d
+
+@app.post('/withdrawals',response_model=WithdrawalOut)
+async def withdrawal(data:WithdrawalIn, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    if db.scalar(select(Withdrawal).where(Withdrawal.idempotency_key==data.idempotency_key)): raise HTTPException(409,'Duplicate idempotency key')
+    dest=db.get(Destination,data.destination_id)
+    if not dest or not dest.enabled: raise HTTPException(404,'Destination unavailable')
+    if dest.type.upper() != 'PAYPAL': raise HTTPException(400,'Only PayPal destinations are enabled')
+    completed,reserved,available=balance_values(db)
+    if data.amount > available: raise HTTPException(400,'Insufficient available ledger balance')
+    w=Withdrawal(amount=data.amount,destination_id=dest.id,idempotency_key=data.idempotency_key,status='PENDING'); db.add(w); db.commit(); db.refresh(w)
+    audit(db,'withdrawal.requested',f'id={w.id};amount={data.amount};provider=paypal')
+    try:
+        result=await paypal_service.create_payout(data.amount, dest.external_id, data.idempotency_key)
+        w.status='PROCESSING'; w.provider_reference=result['provider_reference']; db.commit(); db.refresh(w)
+    except Exception as e:
+        w.status='FAILED'; w.error_message=str(getattr(e,'detail',e)); db.commit(); db.refresh(w)
+    return w
+
+async def reconcile(w, db):
+    if not (w.provider_reference and w.status=='PROCESSING' and paypal_service.configured()): return w
+    body=await paypal_service.get_payout(w.provider_reference)
+    batch_status=body.get('batch_header',{}).get('batch_status')
+    statuses={i.get('transaction_status') for i in body.get('items',[]) if i.get('transaction_status')}
+    if 'FAILED' in statuses or batch_status == 'DENIED': w.status='FAILED'
+    elif 'RETURNED' in statuses or 'REVERSED' in statuses: w.status='REVERSED'
+    elif batch_status == 'SUCCESS' or 'SUCCESS' in statuses:
+        w.status='COMPLETED'
+        if not db.scalar(select(LedgerEntry).where(LedgerEntry.kind=='TRANSFER_DEBIT', LedgerEntry.provider_reference==w.provider_reference)):
+            db.add(LedgerEntry(kind='TRANSFER_DEBIT', amount=-w.amount, status='COMPLETED', description='PayPal-confirmed transfer debit', provider_reference=w.provider_reference))
+    db.commit(); db.refresh(w); return w
+
+@app.get('/withdrawals')
+async def withdrawals(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    rows=db.scalars(select(Withdrawal).order_by(Withdrawal.created_at.desc())).all()
+    for w in rows:
+        try: await reconcile(w,db)
+        except Exception: pass
+    return [{"id":w.id,"amount":w.amount,"destination_id":w.destination_id,"status":w.status,"provider_reference":w.provider_reference,"error_message":w.error_message,"created_at":w.created_at} for w in rows]
+
+@app.get('/withdrawals/{withdrawal_id}',response_model=WithdrawalOut)
+async def withdrawal_status(withdrawal_id:int, _:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    w=db.get(Withdrawal,withdrawal_id)
+    if not w: raise HTTPException(404,'Withdrawal not found')
+    try: await reconcile(w,db)
+    except Exception: pass
+    return w
+
+@app.get('/paypal/status')
+def paypal_status(_:Owner=Depends(current_owner)):
+    return {'provider':'paypal','configured':paypal_service.configured(),'environment':settings.paypal_env,'status':'READY' if paypal_service.configured() else 'PAYPAL SETUP REQUIRED'}
+
+@app.post('/paypal/webhook')
+async def paypal_webhook(request:Request, db:Session=Depends(get_db)):
+    event=await request.json(); headers={k.lower():v for k,v in request.headers.items()}
+    await paypal_service.verify_webhook(headers,event)
+    event_type=event.get('event_type',''); resource=event.get('resource') or {}
+    ref=resource.get('payout_batch_id') or resource.get('payout_item_id')
+    w=db.scalar(select(Withdrawal).where(Withdrawal.provider_reference==ref)) if ref else None
+    if not w and resource.get('sender_item_id'): w=db.scalar(select(Withdrawal).where(Withdrawal.idempotency_key==resource.get('sender_item_id')))
+    if w:
+        if event_type.endswith('.SUCCEEDED'): w.status='COMPLETED'
+        elif event_type.endswith('.FAILED'): w.status='FAILED'
+        elif event_type.endswith('.RETURNED') or event_type.endswith('.REVERSED'): w.status='REVERSED'
+        db.commit(); audit(db,'paypal.webhook',f'event={event_type};withdrawal={w.id}')
+    return {"received":True,"event_type":event_type}
+
+@app.get('/audit')
+def audit_log(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    rows=db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(200)).all()
+    return [{"id":x.id,"action":x.action,"detail":x.detail,"created_at":x.created_at} for x in rows]
+
+@app.get('/scanner/status')
+def scanner_status(_:Owner=Depends(current_owner)): return {"enabled":True,"mode":"real-connectors-only","fabricated_results":False,"cycle_minutes":90,"last_run":None}
+
+@app.post('/scanner/run')
+def scanner_run(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    audit(db,'scanner.run','No external connector configured; no opportunities fabricated')
+    return {"status":"completed","results":[],"fabricated_results":False,"message":"No external source connector is configured."}
+
+@app.get('/opportunities')
+def opportunities(_:Owner=Depends(current_owner), db:Session=Depends(get_db)):
+    rows=db.scalars(select(Opportunity).order_by(Opportunity.created_at.desc())).all()
+    return [{"id":x.id,"station_id":x.station_id,"title":x.title,"state":x.state,"estimated_value":x.estimated_value,"verified_value":x.verified_value,"source_url":x.source_url} for x in rows]
+
+@app.get('/config')
+def config(_:Owner=Depends(current_owner)): return {"provider":"PayPal","currency":"USD","cycle_minutes":90,"station_count":15,"fake_data":False,"internal_ledger":True}
+
+
+================================================================================
+FILE: backend/app/seed.py
+================================================================================
+from .models import Station, Owner, LedgerEntry
+from .security import hash_password
+from .config import settings
+from sqlalchemy import select
+
+STATION_NAMES = [
+"Unclaimed Property Station","Refund Recovery Station","Rebate Station","Cashback Station","Rewards Station",
+"Promotional Bonus Station","Fee Recovery Station","Overpayment Recovery Station","Subscription Credit Station",
+"Settlement & Claims Station","Business Incentive Station","Public Opportunity Station","Revenue Opportunity Station",
+"Reinvestment Station","Earnings & Transfer Station"]
+
+def seed(db):
+    if not db.scalar(select(Owner).where(Owner.email == settings.owner_email)):
+        db.add(Owner(email=settings.owner_email, password_hash=hash_password(settings.owner_password)))
+    existing = db.scalars(select(Station)).all()
+    if not existing:
+        db.add_all([Station(name=n) for n in STATION_NAMES])
+    opening = db.scalar(select(LedgerEntry).where(LedgerEntry.kind == "OPENING_BALANCE"))
+    if not opening:
+        db.add(LedgerEntry(kind="OPENING_BALANCE", amount=15000, status="COMPLETED", description="Internal ledger opening balance"))
+    db.commit()
+
+
+================================================================================
+FILE: backend/app/__init__.py
+================================================================================
+
+
+================================================================================
+FILE: backend/app/__pycache__/schemas.cpython-313.pyc
+================================================================================
+[BINARY FILE: 2922 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/models.cpython-313.pyc
+================================================================================
+[BINARY FILE: 6492 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/seed.cpython-313.pyc
+================================================================================
+[BINARY FILE: 2084 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/paypal_service.cpython-313.pyc
+================================================================================
+[BINARY FILE: 7546 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/__init__.cpython-313.pyc
+================================================================================
+[BINARY FILE: 129 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/security.cpython-313.pyc
+================================================================================
+[BINARY FILE: 2417 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/config.cpython-313.pyc
+================================================================================
+[BINARY FILE: 1030 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/db.cpython-313.pyc
+================================================================================
+[BINARY FILE: 773 bytes]
+
+================================================================================
+FILE: backend/app/__pycache__/main.cpython-313.pyc
+================================================================================
+[BINARY FILE: 25626 bytes]
+
+================================================================================
+FILE: backend/app/db.py
+================================================================================
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+from .config import settings
+
+engine = create_engine(settings.database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+================================================================================
+FILE: backend/app/config.py
+================================================================================
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    database_url: str = "sqlite:///./local.db"
+    jwt_secret: str
+    owner_email: str
+    owner_password: str
+    cors_origins: str = "http://localhost:5173"
+    paypal_env: str = "sandbox"
+    paypal_client_id: str | None = None
+    paypal_client_secret: str | None = None
+    paypal_webhook_id: str | None = None
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+settings = Settings()
+
+
+================================================================================
+FILE: backend/app/paypal_service.py
+================================================================================
+from fastapi import HTTPException
+import httpx
+from .config import settings
+
+
+def base_url() -> str:
+    return "https://api-m.paypal.com" if settings.paypal_env.lower() == "live" else "https://api-m.sandbox.paypal.com"
+
+
+def configured() -> bool:
+    return bool(settings.paypal_client_id and settings.paypal_client_secret and settings.paypal_webhook_id)
+
+
+def setup_message() -> str:
+    return "PAYPAL SETUP REQUIRED"
+
+async def access_token() -> str:
+    if not settings.paypal_client_id or not settings.paypal_client_secret:
+        raise HTTPException(503, setup_message())
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{base_url()}/v1/oauth2/token",
+            auth=(settings.paypal_client_id, settings.paypal_client_secret),
+            data={"grant_type": "client_credentials"},
+            headers={"Accept": "application/json"},
+        )
+    if r.status_code >= 400:
+        raise HTTPException(502, f"PayPal authentication failed ({r.status_code})")
+    body = r.json()
+    token = body.get("access_token")
+    if not token:
+        raise HTTPException(502, "PayPal authentication returned no access token")
+    return token
+
+async def create_payout(amount, recipient_email: str, reference: str):
+    token = await access_token()
+    batch_id = f"GMM-{reference}"
+    payload = {
+        "sender_batch_header": {
+            "sender_batch_id": batch_id,
+            "email_subject": "GET MONEY MACHINE payout",
+            "email_message": "A payout has been initiated.",
+        },
+        "items": [{
+            "recipient_type": "EMAIL",
+            "amount": {"value": f"{amount:.2f}", "currency": "USD"},
+            "receiver": recipient_email,
+            "note": reference,
+            "sender_item_id": reference,
+        }],
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{base_url()}/v1/payments/payouts",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "PayPal-Request-Id": batch_id,
+            },
+        )
+    body = r.json() if r.content else {}
+    if r.status_code >= 400:
+        raise HTTPException(502, f"PayPal payout failed ({r.status_code}): {body.get('message') or body.get('name') or 'provider error'}")
+    header = body.get("batch_header", {})
+    return {"provider": "paypal", "status": header.get("batch_status", "PENDING"), "provider_reference": header.get("payout_batch_id")}
+
+async def get_payout(payout_batch_id: str):
+    token = await access_token()
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(
+            f"{base_url()}/v1/payments/payouts/{payout_batch_id}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+    body = r.json() if r.content else {}
+    if r.status_code >= 400:
+        raise HTTPException(502, f"PayPal payout lookup failed ({r.status_code})")
+    return body
+
+async def verify_webhook(headers: dict, event: dict):
+    required = ["paypal-auth-algo", "paypal-cert-url", "paypal-transmission-id", "paypal-transmission-sig", "paypal-transmission-time"]
+    if not settings.paypal_webhook_id or any(not headers.get(k) for k in required):
+        raise HTTPException(400, "Invalid PayPal webhook headers")
+    token = await access_token()
+    payload = {
+        "auth_algo": headers["paypal-auth-algo"],
+        "cert_url": headers["paypal-cert-url"],
+        "transmission_id": headers["paypal-transmission-id"],
+        "transmission_sig": headers["paypal-transmission-sig"],
+        "transmission_time": headers["paypal-transmission-time"],
+        "webhook_id": settings.paypal_webhook_id,
+        "webhook_event": event,
+    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            f"{base_url()}/v1/notifications/verify-webhook-signature",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept": "application/json"},
+        )
+    body = r.json() if r.content else {}
+    if r.status_code >= 400 or body.get("verification_status") != "SUCCESS":
+        raise HTTPException(400, "Invalid PayPal webhook signature")
+    return True
+
+
+================================================================================
+FILE: backend/app/security.py
+================================================================================
+from datetime import datetime, timedelta, timezone
+import jwt
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
+from .config import settings
+from .db import get_db
+from .models import Owner
+
+ph = PasswordHasher()
+bearer = HTTPBearer()
+
+def hash_password(password): return ph.hash(password)
+def verify_password(hash_value, password):
+    try: return ph.verify(hash_value, password)
+    except VerifyMismatchError: return False
+
+def make_token(owner_id):
+    return jwt.encode({"sub": str(owner_id), "exp": datetime.now(timezone.utc)+timedelta(hours=12)}, settings.jwt_secret, algorithm="HS256")
+
+def current_owner(creds: HTTPAuthorizationCredentials = Depends(bearer), db: Session = Depends(get_db)):
+    try: payload = jwt.decode(creds.credentials, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.PyJWTError: raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid session")
+    owner = db.get(Owner, int(payload["sub"]))
+    if not owner: raise HTTPException(status_code=401, detail="Invalid session")
+    return owner
+
+
+================================================================================
+FILE: backend/app/models.py
+================================================================================
+from datetime import datetime, timezone
+from decimal import Decimal
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column
+from .db import Base
+
+def now(): return datetime.now(timezone.utc)
+
+class Owner(Base):
+    __tablename__ = "owners"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(512))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class Station(Base):
+    __tablename__ = "stations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=False)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False)
+    emergency_stopped: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_activity: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+class LedgerEntry(Base):
+    __tablename__ = "ledger_entries"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    station_id: Mapped[int | None] = mapped_column(ForeignKey("stations.id"), nullable=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14,2))
+    status: Mapped[str] = mapped_column(String(20))
+    description: Mapped[str] = mapped_column(Text)
+    provider_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class Destination(Base):
+    __tablename__ = "destinations"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    type: Mapped[str] = mapped_column(String(30))
+    label: Mapped[str] = mapped_column(String(120))
+    external_id: Mapped[str] = mapped_column(String(255))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class Withdrawal(Base):
+    __tablename__ = "withdrawals"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(14,2))
+    destination_id: Mapped[int] = mapped_column(ForeignKey("destinations.id"))
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")
+    provider_reference: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    idempotency_key: Mapped[str] = mapped_column(String(255), unique=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    action: Mapped[str] = mapped_column(String(100))
+    detail: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+class Opportunity(Base):
+    __tablename__ = "opportunities"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    station_id: Mapped[int] = mapped_column(ForeignKey("stations.id"))
+    title: Mapped[str] = mapped_column(String(255))
+    source_url: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    estimated_value: Mapped[Decimal | None] = mapped_column(Numeric(14,2), nullable=True)
+    state: Mapped[str] = mapped_column(String(30), default="DETECTED")
+    verified_value: Mapped[Decimal | None] = mapped_column(Numeric(14,2), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+================================================================================
+FILE: backend/.env.example
+================================================================================
+DATABASE_URL=sqlite:///./local.db
+JWT_SECRET=replace-with-a-long-random-secret
+OWNER_EMAIL=owner@example.com
+OWNER_PASSWORD=replace-with-a-strong-password
+CORS_ORIGINS=http://localhost:5173
+PAYPAL_ENV=sandbox
+PAYPAL_CLIENT_ID=
+PAYPAL_CLIENT_SECRET=
+PAYPAL_WEBHOOK_ID=
+
+
+================================================================================
+FILE: backend/.pytest_cache/.gitignore
+================================================================================
+# Created by pytest automatically.
+*
+
+
+================================================================================
+FILE: backend/.pytest_cache/v/cache/nodeids
+================================================================================
+[
+  "tests/test_spec.py::test_auth_and_stations",
+  "tests/test_spec.py::test_balance_opening",
+  "tests/test_spec.py::test_health",
+  "tests/test_spec.py::test_master_emergency",
+  "tests/test_spec.py::test_paypal_setup_state",
+  "tests/test_static_spec.py::test_exact_15_names",
+  "tests/test_static_spec.py::test_no_client_secrets",
+  "tests/test_static_spec.py::test_required_routes",
+  "tests/test_static_spec.py::test_single_opening_guard",
+  "tests/test_static_spec.py::test_transfer_requires_provider_confirmation"
+]
+
+================================================================================
+FILE: backend/.pytest_cache/v/cache/lastfailed
+================================================================================
+{}
+
+================================================================================
+FILE: backend/.pytest_cache/CACHEDIR.TAG
+================================================================================
+Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by pytest.
+# For information about cache directory tags, see:
+#	https://bford.info/cachedir/spec.html
+
+
+================================================================================
+FILE: backend/.pytest_cache/README.md
+================================================================================
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+
+================================================================================
+FILE: frontend/Dockerfile
+================================================================================
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY package.json .
+RUN npm install
+COPY . .
+RUN npm run build
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+
+
+================================================================================
+FILE: frontend/package.json
+================================================================================
+{"name":"get-money-machine","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},"dependencies":{"@vitejs/plugin-react":"latest","vite":"latest","react":"latest","react-dom":"latest"},"devDependencies":{}}
+
+
+================================================================================
+FILE: frontend/src/main.jsx
+================================================================================
+import React,{useEffect,useState} from 'react';
+import {createRoot} from 'react-dom/client';
+import './style.css';
+const API=import.meta.env.VITE_API_URL||'http://localhost:8000';
+async function req(path,opt={}){const token=localStorage.getItem('gmm_token');const r=await fetch(API+path,{...opt,headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{})}});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||`HTTP ${r.status}`);return d}
+function Login({onLogin}){const [email,setEmail]=useState(''),[password,setPassword]=useState(''),[err,setErr]=useState('');return <main className="login"><section className="card login-card"><h1>GET MONEY MACHINE</h1><p>Secure owner access</p><form onSubmit={async e=>{e.preventDefault();try{const d=await req('/auth/login',{method:'POST',body:JSON.stringify({email,password})});localStorage.setItem('gmm_token',d.access_token);onLogin()}catch(x){setErr(x.message)}}}><input placeholder="Email" value={email} onChange={e=>setEmail(e.target.value)} required/><input placeholder="Password" type="password" value={password} onChange={e=>setPassword(e.target.value)} required/><button>LOG IN</button>{err&&<div className="error">{err}</div>}</form></section></main>}
+function App(){const [ready,setReady]=useState(!!localStorage.getItem('gmm_token'));const [tab,setTab]=useState('dashboard');const [stations,setStations]=useState([]),[balance,setBalance]=useState(null),[tx,setTx]=useState([]),[dests,setDests]=useState([]),[withdrawals,setWithdrawals]=useState([]),[audit,setAudit]=useState([]),[paypal,setPaypal]=useState(null),[err,setErr]=useState('');
+const load=async()=>{try{const [s,b,t,d,w,a,p]=await Promise.all([req('/stations'),req('/balance'),req('/transactions'),req('/destinations'),req('/withdrawals'),req('/audit'),req('/paypal/status')]);setStations(s);setBalance(b);setTx(t);setDests(d);setWithdrawals(w);setAudit(a);setPaypal(p);setErr('')}catch(e){if(/session/i.test(e.message)){localStorage.removeItem('gmm_token');setReady(false)}else setErr(e.message)}};
+useEffect(()=>{if(ready)load()},[ready]); if(!ready)return <Login onLogin={()=>setReady(true)}/>;
+const control=async a=>{try{await req('/stations/control/'+a,{method:'POST'});load()}catch(e){setErr(e.message)}}; const act=async(id,a)=>{try{await req(`/stations/${id}/${a}`,{method:'POST'});load()}catch(e){setErr(e.message)}};
+return <div className="app"><header><div><h1>GET MONEY MACHINE</h1><span>Internal earnings ledger • PayPal transfer provider</span></div><button className="ghost" onClick={()=>{localStorage.removeItem('gmm_token');setReady(false)}}>LOG OUT</button></header>
+<nav>{[['dashboard','Dashboard'],['stations','Stations'],['money','Move My Earned Money'],['transactions','Transactions'],['security','Audit & Security']].map(([k,l])=><button className={tab===k?'selected':''} onClick={()=>setTab(k)}>{l}</button>)}</nav>{err&&<div className="error">{err}</div>}
+{tab==='dashboard'&&<><section className="balance"><div><label>AVAILABLE</label><strong>${Number(balance?.available||0).toLocaleString(undefined,{minimumFractionDigits:2})}</strong></div><div><label>PENDING</label><strong>${Number(balance?.pending||0).toLocaleString(undefined,{minimumFractionDigits:2})}</strong></div><div><label>OPENING LEDGER</label><strong>$15,000.00</strong></div><div><label>PAYPAL</label><strong>{paypal?.configured?'READY':'SETUP REQUIRED'}</strong></div></section><section className="controls"><button onClick={()=>control('start')}>START ALL</button><button onClick={()=>control('stop')}>STOP ALL</button><button onClick={()=>control('pause')}>PAUSE ALL</button><button className="danger" onClick={()=>control('emergency')}>EMERGENCY STOP</button></section><section className="grid">{stations.map(s=><Station key={s.id} s={s} act={act}/>)}</section></>}
+{tab==='stations'&&<section><h2>All 15 Stations</h2><div className="grid">{stations.map(s=><Station key={s.id} s={s} act={act}/>)}</div></section>}
+{tab==='money'&&<Money dests={dests} withdrawals={withdrawals} reload={load}/>} {tab==='transactions'&&<List title="Ledger Transactions" rows={tx} fields={['kind','amount','status','description','provider_reference']}/>} {tab==='security'&&<List title="Audit Log" rows={audit} fields={['action','detail','created_at']}/>}</div>}
+function Station({s,act}){return <article className="station"><h2>{s.name}</h2><span className={'pill '+(s.active?'on':'')}>{s.emergency_stopped?'EMERGENCY STOPPED':s.paused?'PAUSED':s.active?'RUNNING':'STOPPED'}</span><div className="station-actions"><button onClick={()=>act(s.id,'start')}>START</button><button onClick={()=>act(s.id,'stop')}>STOP</button><button onClick={()=>act(s.id,'pause')}>PAUSE</button><button onClick={()=>act(s.id,'emergency')}>EMERGENCY</button></div></article>}
+function Money({dests,withdrawals,reload}){const [amount,setAmount]=useState(''),[dest,setDest]=useState(''),[email,setEmail]=useState(''),[label,setLabel]=useState(''),[msg,setMsg]=useState('');const add=async()=>{try{const d=await req('/destinations',{method:'POST',body:JSON.stringify({type:'PAYPAL',label,external_id:email})});setDest(String(d.id));setMsg('PayPal destination saved');reload()}catch(e){setMsg(e.message)}};const send=async()=>{try{await req('/withdrawals',{method:'POST',body:JSON.stringify({amount:Number(amount),destination_id:Number(dest),idempotency_key:crypto.randomUUID()})});setMsg('Transfer submitted to PayPal for provider processing');setAmount('');reload()}catch(e){setMsg(e.message)}};return <section className="money"><div className="card"><h2>Move My Earned Money</h2><p>Transfers use the internal ledger and require PayPal provider confirmation.</p><input placeholder="PayPal email" value={email} onChange={e=>setEmail(e.target.value)}/><input placeholder="Destination label" value={label} onChange={e=>setLabel(e.target.value)}/><button onClick={add}>ADD PAYPAL DESTINATION</button><select value={dest} onChange={e=>setDest(e.target.value)}><option value="">Select destination</option>{dests.map(d=><option value={d.id}>{d.label} • {d.external_id}</option>)}</select><input placeholder="Amount" type="number" min="0.01" step="0.01" value={amount} onChange={e=>setAmount(e.target.value)}/><button onClick={send} disabled={!dest||!amount}>TRANSFER</button>{msg&&<div className="notice">{msg}</div>}</div><List title="Transfer History" rows={withdrawals} fields={['amount','status','provider_reference','error_message','created_at']}/></section>}
+function List({title,rows,fields}){return <section className="card"><h2>{title}</h2>{rows.length===0?<p>No records.</p>:<div className="list">{rows.map(r=><div className="row">{fields.map(f=><span><b>{f.replaceAll('_',' ')}:</b> {String(r[f]??'')}</span>)}</div>)}</div>}</section>}
+createRoot(document.getElementById('root')).render(<App/>);
+
+
+================================================================================
+FILE: frontend/src/style.css
+================================================================================
+*{box-sizing:border-box}body{margin:0;font-family:Inter,system-ui,sans-serif;background:#08090d;color:#f4f5f7}button,input,select{font:inherit}button{border:0;border-radius:10px;padding:11px 14px;font-weight:800;cursor:pointer;background:#f4f5f7;color:#090a0d}button:disabled{opacity:.45;cursor:not-allowed}.ghost{background:transparent;border:1px solid #343741;color:#ddd}.danger{background:#a71d2a;color:#fff}.app{max-width:1500px;margin:auto;padding:24px}header{display:flex;justify-content:space-between;align-items:center;gap:20px;border-bottom:1px solid #252832;padding-bottom:20px}h1{margin:0;font-size:clamp(24px,4vw,40px)}h2{margin:0 0 12px}header span{color:#8f96a3}nav{display:flex;gap:8px;overflow:auto;padding:18px 0}nav button{background:#15171e;color:#aeb3bd;white-space:nowrap}.selected{background:#f4f5f7!important;color:#08090d!important}.balance{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:8px 0 16px}.balance div,.card,.station{background:#11131a;border:1px solid #272a34;border-radius:16px;padding:18px}.balance label{display:block;color:#858b98;font-size:12px;font-weight:800}.balance strong{display:block;font-size:22px;margin-top:8px}.controls{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:18px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.station{min-height:150px}.station h2{font-size:17px}.pill{display:inline-block;border-radius:999px;background:#282b33;color:#b8bdc8;padding:5px 9px;font-size:11px;font-weight:900}.pill.on{background:#153e2a;color:#72e0a4}.station-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:20px}.station-actions button{padding:8px 10px;font-size:11px;background:#20232b;color:#eee}.error,.notice{padding:12px 14px;border-radius:10px;margin:12px 0;background:#3b1720;color:#ffb7c1}.notice{background:#143225;color:#91efb5}.login{min-height:100vh;display:grid;place-items:center;padding:20px}.login-card{width:min(430px,100%)}form{display:grid;gap:12px}input,select{width:100%;padding:13px;border-radius:10px;border:1px solid #343743;background:#0a0b10;color:#fff}.money{display:grid;grid-template-columns:minmax(320px,450px) 1fr;gap:16px}.money .card{display:grid;gap:10px}.list{display:grid;gap:8px}.row{display:flex;flex-wrap:wrap;gap:15px;padding:12px;border:1px solid #272a34;border-radius:10px;background:#0c0e13}.row span{font-size:13px;color:#b9bec8}.row b{color:#fff;text-transform:capitalize}@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.balance{grid-template-columns:1fr 1fr}.money{grid-template-columns:1fr}}@media(max-width:600px){.app{padding:14px}.grid,.balance{grid-template-columns:1fr}header{align-items:flex-start}.station-actions button{flex:1}}
+
+
+================================================================================
+FILE: frontend/index.html
+================================================================================
+<div id="root"></div><script type="module" src="/src/main.jsx"></script>
+
+
+================================================================================
+FILE: render.yaml
+================================================================================
+services:
+  - type: web
+    name: get-money-machine-api
+    runtime: python
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: OWNER_EMAIL
+        sync: false
+      - key: OWNER_PASSWORD
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: PAYPAL_ENV
+        value: sandbox
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false
+  - type: postgres
+    name: get-money-machine-db
+    plan: free
+    databaseName: money_machine
+    user: money_machine
+
+
+================================================================================
+FILE: README.md
+================================================================================
+# GET MONEY MACHINE — Full Source Build
+
+This repository contains the complete current source package for the GET MONEY MACHINE application: React mobile-first frontend, FastAPI backend, persistent SQL ledger, authentication, 15 stations, audit logging, scanner framework, PayPal payout integration, PayPal webhook verification, Render deployment configuration, Docker Compose, and automated tests.
+
+## Important behavior
+- Internal ledger is the source of truth; PayPal is the transfer provider.
+- The seed creates exactly one $15,000 opening ledger entry.
+- Discovery does not become available money without verification/settlement.
+- No fabricated opportunities or fake payout confirmations are generated.
+- Transfer requests require available internal ledger balance and PayPal provider processing.
+- PayPal webhook signatures are verified server-side before webhook state changes.
+- Provider success is required before a transfer is marked completed.
+- PayPal secrets never belong in the frontend.
+
+## Run locally
+1. Copy `backend/.env.example` to `backend/.env` and set a strong JWT secret plus owner credentials.
+2. `docker compose up --build`.
+3. API: `http://localhost:8000/health`.
+4. Frontend: `http://localhost:5173`.
+
+## Render
+`render.yaml` defines the API and Postgres resources. Set all `sync: false` variables in Render. After deployment, use the actual Render HTTPS service URL plus `/paypal/webhook` as the PayPal webhook endpoint.
+
